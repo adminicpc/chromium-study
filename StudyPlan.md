@@ -2,7 +2,7 @@
 
 > 目标：理解 Chromium `net` 模块的分层架构，吃透 socket 的封装、生命周期与异步 IO 模型，提炼出可复用到自己项目的现代 C++ 网络编程范式。
 >
-> 说明：`net/socket/` 目录（`StreamSocket`/`ServerSocket`/`TCPServerSocket`/`SocketPosix` 等）位于 `studysocket` 分支。本文档在 `studysocket` 分支上撰写，可完整引用 socket 层源码。`net/server/http_server.cc` 是"如何用 socket 抽象搭服务"的范本，`net/socket/socket_posix.cc` 是"POSIX 阻塞 syscall 如何变成异步 IO"的范本，两者一上一下构成完整闭环。
+> 说明：本项目是 **Windows 平台**，因此 Windows IOCP（Proactor）实现是学习重点，POSIX Reactor 作为对照理解。核心文件：[net/socket/tcp_socket_io_completion_port_win.cc](net/socket/tcp_socket_io_completion_port_win.cc)（Windows IOCP）、[net/socket/socket_posix.cc](net/socket/socket_posix.cc)（POSIX Reactor）、[net/server/http_server.cc](net/server/http_server.cc)（上层用法范本）。三者构成"上层用法 + 两种平台底层实现"的完整闭环。
 
 ---
 
@@ -16,6 +16,7 @@
 | 3 | 生命周期管理：WeakPtr + 延迟销毁 | [net/server/http_server.cc](net/server/http_server.cc) | ✅ 已完成 |
 | 4 | 实战案例：HttpServer / HttpConnection / WebSocket | [net/server/](net/server/) | ✅ 已完成 |
 | 4.5 | Socket 层内部实现：类层级 + Reactor 模式 + errno 映射 | [net/socket/socket_posix.cc](net/socket/socket_posix.cc)、[net/socket/tcp_server_socket.cc](net/socket/tcp_server_socket.cc) | ✅ 已完成 |
+| 4.6 | Windows IOCP 实现（Proactor 模式）**★ 项目重点** | [net/socket/tcp_socket_io_completion_port_win.cc](net/socket/tcp_socket_io_completion_port_win.cc)、[net/socket/tcp_socket_win.h](net/socket/tcp_socket_win.h) | ✅ 已完成 |
 | 5 | 落地 demo（套用模式写一个 TCP echo server） | — | ⏳ 待后续需求 |
 | 6 | 集成到自己的项目 | — | ⏳ 待领导安排 |
 
@@ -29,18 +30,19 @@ Chromium 的 `net` 模块是典型的分层设计，自底向上：
 
 ```
 ┌─────────────────────────────────────────────┐
-│  应用层：net/server (HttpServer, WebSocket)   │  ← 本仓库有
+│  应用层：net/server (HttpServer, WebSocket)   │
 ├─────────────────────────────────────────────┤
-│  协议层：net/http, net/spdy, net/quic, net/ssl│  ← 部分有
+│  协议层：net/http, net/spdy, net/quic, net/ssl│
 ├─────────────────────────────────────────────┤
-│  Socket 层：net/socket (StreamSocket 等)      │  ← 本仓库未包含
+│  Socket 层：net/socket (StreamSocket 等)      │
 ├─────────────────────────────────────────────┤
-│  基础抽象：net/base (IOBuffer, errors, ...)   │  ← 本仓库有
+│  基础抽象：net/base (IOBuffer, errors, ...)   │
 └─────────────────────────────────────────────┘
 ```
 
 - **net/base**：与协议无关的基础设施。错误码、IP 地址、IOBuffer、回调、网络变化通知等都在这里。是学习"设计思想"的最佳入口。
-- **net/socket**：对原生 socket（POSIX / Winsock）的跨平台封装，定义了 `Socket` / `StreamSocket` / `ServerSocket` 抽象接口，`TCPClientSocket` / `TCPServerSocket` 等 TCP 实现，以及底层的 `SocketPosix`（Reactor）。详见 [3.5 节](#三五socket-层内部实现类层级与-reactor-模式)。
+- **net/socket**：对原生 socket（POSIX / Winsock）的跨平台封装，定义了 `Socket` / `StreamSocket` / `ServerSocket` 抽象接口，`TCPClientSocket` / `TCPServerSocket` 等 TCP 实现，以及底层的 `SocketPosix`（Reactor）/ `TcpSocketIoCompletionPortWin`（Proactor）。详见 [3.5 节](#三五socket-层内部实现类层级) 与 [3.6 节](#三六-windows-iocp-实现proactor-模式重点)。
+- **net/http, net/spdy, net/quic, net/ssl**：协议层实现，建立在 socket 抽象之上。
 - **net/server**：用 socket 抽象搭出的 HTTP/WebSocket 服务器，是"如何用 Chromium 风格写网络服务"的范本。
 
 **分层的关键纪律**：上层只依赖下层的抽象接口（如 `HttpServer` 只持有 `std::unique_ptr<ServerSocket>` 和 `StreamSocket*`，不依赖具体 TCP/SSL 实现），从而实现跨平台与可测试性。
@@ -118,31 +120,37 @@ using CompletionOnceCallback = base::OnceCallback<void(int)>;
 
 ---
 
-## 三点五、Socket 层内部实现：类层级与 Reactor 模式
+## 三点五、Socket 层内部实现：类层级
 
-> 这是补足底层的一节。第四章的三段式模式是"上层如何用 socket"，本节是"socket 内部如何把阻塞 syscall 变成异步"。
+> 本节是"socket 内部如何把阻塞 syscall 变成异步"。POSIX 用 Reactor（epoll/kqueue + 非阻塞 fd），Windows 用 Proactor（IOCP + overlapped IO）。两者都满足上层 `Socket` 接口的异步契约，但实现哲学不同。
 
-### 3.5.1 五层类层级
+### 3.5.1 类层级（POSIX 与 Windows 对照）
 
 ```
-StreamSocket / ServerSocket        net/socket/{stream,server}_socket.h   ← 公开抽象接口（虚函数）
+StreamSocket / ServerSocket              net/socket/{stream,server}_socket.h   ← 跨平台公开抽象接口
         ↑ inherits
-TCPClientSocket / TCPServerSocket  net/socket/tcp_{client,server}_socket ← TCP 专用，处理 TCP 选项、握手
-        ↑ owns
-TCPSocketPosix                     net/socket/tcp_socket_posix.h         ← 平台 TCP 层（Win 有对应 TCPSocketWin）
-        ↑ owns
-SocketPosix                        net/socket/socket_posix.{h,cc}        ← POSIX syscall 封装 + MessagePumpForIO 集成
-        ↑
-POSIX syscalls: socket/bind/listen/accept/connect/read/send
+TCPClientSocket / TCPServerSocket        net/socket/tcp_{client,server}_socket ← TCP 专用，处理 TCP 选项
+        ↑ owns (平台二选一)
+┌─────────────────────────────────────┬─────────────────────────────────────────────────────────┐
+│ POSIX 分支                          │ Windows 分支                                             │
+├─────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+│ TCPSocketPosix                      │ TCPSocketWin (基类, 抽象 Read/Write)                    │
+│   ↑ owns                            │   ↑ inherits                                            │
+│ SocketPosix                         │ TcpSocketIoCompletionPortWin (★ IOCP, 新)              │
+│   : FdWatcher                       │   : CoreImpl : IOHandler                                │
+│   ↑                                 │ TCPSocketDefaultWin (旧, ObjectWatcher, 不再推荐)       │
+│ POSIX: socket/accept/connect/       │ Winsock: WSARecv/WSASend/WSAConnect (带 OVERLAPPED)    │
+│         read/send (非阻塞)          │                                                         │
+└─────────────────────────────────────┴─────────────────────────────────────────────────────────┘
 ```
 
 **每一层职责单一、可替换**：
-- `Socket` / `StreamSocket` / `ServerSocket`：纯接口，定义 `Read/Write/Connect/Accept` 的异步契约（[socket.h](net/socket/socket.h)、[stream_socket.h](net/socket/stream_socket.h)、[server_socket.h](net/socket/server_socket.h)）。上层（如 `HttpServer`）只依赖这层。
-- `TCPClientSocket` / `TCPServerSocket`：TCP 协议专用，加 TCP 选项（`SetIPv6Only`、`SetDefaultOptionsForServer`）、把 `TCPSocket` 包成 `StreamSocket` 接口。
-- `TCPSocketPosix`：平台胶水，把 `SocketPosix` 的 `SockaddrStorage` 接口适配成 `IPEndPoint`。
-- `SocketPosix`：真正的核心，持有 fd、watcher、callback，把阻塞 syscall 翻译成异步。
+- `Socket` / `StreamSocket` / `ServerSocket`：纯接口，定义 `Read/Write/Connect/Accept` 的异步契约（[socket.h](net/socket/socket.h)、[stream_socket.h](net/socket/stream_socket.h)、[server_socket.h](net/socket/server_socket.h)）。上层（如 `HttpServer`）只依赖这层，不感知平台。
+- `TCPClientSocket` / `TCPServerSocket`：TCP 协议专用，加 TCP 选项（`SetIPv6Only`、`SetDefaultOptionsForServer`）、把底层 TCP socket 包成 `StreamSocket` 接口。
+- **POSIX 分支**：`TCPSocketPosix`（平台胶水，`SockaddrStorage` ↔ `IPEndPoint`）owns `SocketPosix`（Reactor 核心，持有 fd、watcher、callback）。
+- **Windows 分支**：`TCPSocketWin`（基类，处理 socket 选项、connect）有虚 `Read/Write`，子类 `TcpSocketIoCompletionPortWin`（IOCP，[3.6 节](#三六-windows-iocp-实现proactor-模式重点)）和 `TCPSocketDefaultWin`（旧实现）。
 
-### 3.5.2 SocketPosix 就是 Reactor
+### 3.5.2 SocketPosix 就是 Reactor（POSIX 分支）
 
 [socket_posix.h#L27-L28](net/socket/socket_posix.h#L27-L28)：
 
@@ -262,6 +270,173 @@ int TCPServerSocket::Accept(socket, callback, peer_address) {
 ```
 
 注意这里用的是 `base::Unretained(this)` 而非 `WeakPtr`——[注释 L96-L97](net/socket/tcp_server_socket.cc#L96-L97) 解释：`socket_` 由 `this` 拥有，`socket_` 析构前回调必不触发，故 `this` 也必存活。这是比 `WeakPtr` 更轻量的"生命周期保证"推理，值得学。
+
+---
+
+## 三点六、Windows IOCP 实现（Proactor 模式）★ 项目重点
+
+> 本项目是 Windows 平台，IOCP 是核心。本节对照 POSIX Reactor 讲 Windows Proactor 的差异。
+>
+> 核心文件：[tcp_socket_io_completion_port_win.h](net/socket/tcp_socket_io_completion_port_win.h) / [.cc](net/socket/tcp_socket_io_completion_port_win.cc)，基类 [tcp_socket_win.h](net/socket/tcp_socket_win.h)。
+
+### 3.6.1 Reactor vs Proactor：两种异步模型
+
+| 维度 | POSIX Reactor (`SocketPosix`) | Windows Proactor (`TcpSocketIoCompletionPortWin`) |
+|------|-------------------------------|---------------------------------------------------|
+| 模型 | Reactor：就绪通知 | Proactor：完成通知 |
+| 底层机制 | epoll/kqueue + 非阻塞 fd | IOCP + overlapped IO |
+| syscall | `read`/`send`（非阻塞，返回 `EAGAIN`） | `WSARecv`/`WSASend`（带 OVERLAPPED，返回 `WSA_IO_PENDING`） |
+| 数据就绪时机 | 内核通知"可读了"，**应用再调一次 syscall 才真读** | 内核**直接把数据读进 buffer**，完成后通知"已读完" |
+| buffer 归属 | 等待期间可不持有（`ReadIfReady`） | 发起时必须交给内核（OVERLAPPED 携带 buffer 指针） |
+| 触发方式 | level-triggered，手动重新注册 watcher | 一次性，完成包入队即触发 |
+| 同步完成优化 | 无（同步成功就直接返回字节数） | `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`：同步完成时**跳过** IOCP，避免 PostTask 开销 |
+| Connect | `EINPROGRESS` → 监听 `WATCH_WRITE` | 不能用 IOCP，用 `WSAEvent` + `ObjectWatcher` |
+
+**最本质的差异**：Reactor 是"告诉我什么时候能做，我自己做"；Proactor 是"你帮我做，做完通知我"。Proactor 把数据搬运交给内核，应用线程更省。
+
+### 3.6.2 CoreImpl：IOHandler + ObjectWatcher 双重身份
+
+[tcp_socket_io_completion_port_win.cc#L117-L120](net/socket/tcp_socket_io_completion_port_win.cc#L117-L120)：
+
+```cpp
+class TcpSocketIoCompletionPortWin::CoreImpl
+    : public TCPSocketWin::Core,
+      public base::win::ObjectWatcher::Delegate,      // 给 connect 用
+      public base::MessagePumpForIO::IOHandler {       // 给 read/write 用
+```
+
+`CoreImpl` 同时实现两个 delegate，因为 Windows 上 read/write 走 IOCP，而 connect 不能走 IOCP（只能用 `WSAEventSelect` + 事件对象），所以 connect 走 `ObjectWatcher` 监听 `WSACreateEvent`。
+
+注册流程在 `EnsureOverlappedIOInitialized`（[tcp_socket_io_completion_port_win.cc#L350-L394](net/socket/tcp_socket_io_completion_port_win.cc#L350-L394)）：
+
+```cpp
+// 1. 把 socket 句柄注册到 IOCP，关联 CoreImpl 作为 IOHandler
+registered_as_io_handler_ = base::CurrentIOThread::Get()->RegisterIOHandler(
+    reinterpret_cast<HANDLE>(socket_), &core);
+// 2. 激活"同步完成跳过 IOCP"优化（需 IFS 句柄）
+::SetFileCompletionNotificationModes(
+    reinterpret_cast<HANDLE>(socket_),
+    FILE_SKIP_COMPLETION_PORT_ON_SUCCESS);
+```
+
+### 3.6.3 Write 的完整异步流程
+
+[tcp_socket_io_completion_port_win.cc#L269-L338](net/socket/tcp_socket_io_completion_port_win.cc#L269-L338)：
+
+```cpp
+int TcpSocketIoCompletionPortWin::Write(buf, buf_len, callback, ...) {
+  EnsureOverlappedIOInitialized();
+  WSABUF write_buffer{.len = buf_len, .buf = buf->data()};
+  auto context = std::make_unique<CoreImpl::IOContext>(&core);  // 携带 OVERLAPPED
+
+  int rv = ::WSASend(socket_, &write_buffer, 1, &bytes_sent, 0,
+                     context->GetOverlapped(), nullptr);
+  if (rv == 0) {
+    // ★ 同步完成（与 POSIX EAGAIN 不同！这里数据已发出）
+    if (skip_completion_port_on_success_) {
+      context.reset();                    // 跳过 IOCP，直接返回
+    } else {
+      context.release();                  // 让 OnIOCompleted 接管（即便已处理）
+    }
+    return DidCompleteWrite(bytes_sent, ERROR_SUCCESS, buf, buf_len);
+  }
+  // rv == SOCKET_ERROR
+  int wsa_error = ::WSAGetLastError();
+  if (wsa_error == WSA_IO_PENDING) {
+    // ★ 异步进行中：buffer 交给内核，完成后 OnIOCompleted 回调
+    context->buffer = buf;                // 持有 buffer 直到完成
+    context->completion_callback = std::move(callback);
+    context->completion_method = &DidCompleteWrite;
+    context.release();                    // 所有权转给 OnIOCompleted
+    return ERR_IO_PENDING;
+  }
+  // 真错误
+  context.reset();
+  return MapSystemError(wsa_error);
+}
+```
+
+**关键对比 POSIX**：
+- POSIX `send` 返回 `EAGAIN` → 数据**没发**，注册 watcher 等可写。
+- Windows `WSASend` 返回 `WSA_IO_PENDING` → 数据**已交给内核**正在发，buffer 不能动，完成时回调。
+- POSIX 同步成功返回字节数就完事；Windows 同步成功（`rv == 0`）**默认还会触发 IOCP 完成包**，所以要 `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` 优化掉这个多余的 PostTask。
+
+### 3.6.4 Read 的两种模式：Read vs ReadIfReady
+
+Windows IOCP 下 buffer 一旦发起就被内核持有，这让 `ReadIfReady`（"只通知可读，不真读"）变得棘手。Chromium 的解法在 `HandleReadRequest`（[tcp_socket_io_completion_port_win.cc#L458-L587](net/socket/tcp_socket_io_completion_port_win.cc#L458-L587)）：
+
+**`Read`（`allow_zero_byte_overlapped_read = false`）**：
+```cpp
+// 直接用调用者的 buffer 发起 overlapped read
+WSARecv(socket_, &read_buffer, 1, &bytes_read, &flags,
+        context->GetOverlapped(), nullptr);
+// WSA_IO_PENDING → 持有调用者 buffer，完成时数据已读好
+```
+
+**`ReadIfReady`（`allow_zero_byte_overlapped_read = true`）**：
+```cpp
+// 1. 先试非 overlapped 的 WSARecv（带调用者 buffer）
+WSARecv(socket_, &read_buffer, 1, ..., /*overlapped=*/nullptr, nullptr);
+//    若返回 0：数据已就绪，立即返回字节数
+//    若 WSAEWOULDBLOCK：没数据，进入步骤 2
+// 2. 发起"零字节 overlapped read"——buffer 长度为 0，纯粹为了等"可读"通知
+read_buffer = {};   // 零字节
+WSARecv(socket_, &read_buffer, 1, ..., context->GetOverlapped(), nullptr);
+//    WSA_IO_PENDING → 不持有调用者 buffer，完成时只通知"可读了"
+//    调用者收到 OK 后再调 ReadIfReady 真正读取
+```
+
+这个"零字节 overlapped read"是 Windows IOCP 实现 `ReadIfReady` 的经典技巧——用一次空读换取"可读"通知，避免持有调用者 buffer。
+
+### 3.6.5 IOContext：overlapped 操作的上下文载体
+
+[tcp_socket_io_completion_port_win.cc#L122-L149](net/socket/tcp_socket_io_completion_port_win.cc#L122-L149)：
+
+```cpp
+struct IOContext : public base::MessagePumpForIO::IOContext {
+  const scoped_refptr<CoreImpl> core_keep_alive;  // ★ 自保活，直到 IO 完成
+  scoped_refptr<IOBuffer> buffer;                  // 操作的 buffer
+  int buffer_length = 0;
+  CompletionMethod completion_method = nullptr;    // 完成时调哪个 DidCompleteXxx
+  CompletionOnceCallback completion_callback;      // 上层回调
+};
+```
+
+**`core_keep_alive` 是关键**：IOCP 完成包可能在 socket 对象析构后才入队，`core_keep_alive` 让 `CoreImpl` 在 IO 完成前不被销毁。`OnIOCompleted`（[L640-L659](net/socket/tcp_socket_io_completion_port_win.cc#L640-L659)）检查 `socket_` 是否还为 null（`Detach` 时置 null），若已 detach 则只释放 context 不调 completion。
+
+### 3.6.6 完成回调路径
+
+```
+内核完成 IO → IOCP 完成包入队
+  → MessagePumpForIO 取出包，调 IOHandler::OnIOCompleted
+      → CoreImpl::OnIOCompleted(context, bytes, error)   [L640]
+          → std::invoke(completion_method, socket_, ...)  // 调 DidCompleteRead/Write
+          → Run(completion_callback, rv)                   // 触发上层回调
+          → unique_ptr<IOContext> 析构                     // 释放 buffer 引用 + core_keep_alive
+```
+
+`OnIOCompleted` 用 `std::unique_ptr<IOContext> derived_context(static_cast<IOContext*>(context))` 接管 context 所有权——发起时 `context.release()` 放手，完成时 `OnIOCompleted` 接手，RAII 自动清理。这是 Windows overlapped IO 的标准所有权流转模式。
+
+### 3.6.7 Connect 的特殊处理（不走 IOCP）
+
+[tcp_socket_io_completion_port_win.cc#L611-L638](net/socket/tcp_socket_io_completion_port_win.cc#L611-L638)：
+
+```cpp
+HANDLE CoreImpl::GetConnectEvent() {
+  connect_event_.Set(::WSACreateEvent());
+  ::WSAEventSelect(socket_->socket_, connect_event_.get(), FD_CONNECT);  // 绑定 connect 事件
+  return connect_event_.get();
+}
+void CoreImpl::WatchForConnect() {
+  connect_watcher_.StartWatchingOnce(connect_event_.get(), this);  // 一次性监听
+}
+void CoreImpl::OnObjectSignaled(HANDLE object) {
+  // connect 完成，调 TCPSocketWin::DidCompleteConnect
+  socket_->DidCompleteConnect();
+}
+```
+
+Windows 的 `connect` 不能像 POSIX 那样用 `EINPROGRESS` + fd 可写事件，只能用 `WSAEventSelect` + 事件对象 + `ObjectWatcher`。这是 Windows 异步 socket 的一个历史包袱。
 
 ---
 
@@ -432,12 +607,19 @@ rv = connection->socket()->Read(read_buf, read_buf->RemainingCapacity(), ...);
 13. **syscall 用 `HANDLE_EINTR` 包裹**：自动重试被信号中断的调用，避免 `EINTR` 误判为错误。
 14. **全双工靠独立 watcher**：读和写各有独立的 watcher + buffer + callback，可同时挂一个读一个写。
 15. **生命周期用 `Unretained` 推理代替 `WeakPtr`**：当回调的触发由被 owns 的对象决定时（如 `socket_` owns fd，fd 析构前回调必不触发），用 `base::Unretained(this)` 比 `WeakPtr` 更轻量。只有回调可能跨对象析构时才用 `WeakPtr`。
+16. **Windows 用 Proactor（IOCP）而非 Reactor** ★：`WSARecv`/`WSASend` 带 OVERLAPPED 发起，`WSA_IO_PENDING` 对应 `ERR_IO_PENDING`，内核完成时回调 `OnIOCompleted`（数据已就绪，无需再 syscall）。比 Reactor 更省应用线程。
+17. **`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` 优化** ★：Windows overlapped IO 同步成功时默认仍会发 IOCP 完成包，造成多余 PostTask。设此标志让同步成功直接返回，跳过 IOCP。需 IFS 句柄（`SkipCompletionPortOnSuccessIsSupported` 检查）。
+18. **overlapped IO 的 buffer 必须在发起时交给内核** ★：与 POSIX 不同，Windows IOCP 下 buffer 在 `WSARecv`/`WSASend` 返回 `WSA_IO_PENDING` 后就被内核持有，完成前不能动。用 `IOContext` 携带 `scoped_refptr<IOBuffer>` 保活。
+19. **`ReadIfReady` 用零字节 overlapped read 实现** ★：Windows IOCP 下无法"只通知不读"，Chromium 用发起 0 字节 `WSARecv` 的技巧换取"可读"通知，避免持有调用者 buffer。
+20. **overlapped context 用 `release()`/`unique_ptr` 转移所有权** ★：发起时 `context.release()` 放手让 `OnIOCompleted` 接管，完成时 `unique_ptr<IOContext>` 接手，RAII 自动清理。这是 overlapped IO 的标准所有权流转。
+21. **`core_keep_alive` 自保活** ★：IOCP 完成包可能在 socket 析构后入队，`IOContext` 持有 `scoped_refptr<CoreImpl>` 让其在 IO 完成前不被销毁。`OnIOCompleted` 检查 `socket_` 是否已 detach（置 null），是则只清理不调回调。
+22. **Windows connect 不能用 IOCP** ★：用 `WSAEventSelect(FD_CONNECT)` + `WSACreateEvent` + `ObjectWatcher` 监听 connect 完成。`CoreImpl` 同时实现 `IOHandler`（read/write）和 `ObjectWatcher::Delegate`（connect）。
 
 ---
 
 ## 八、待补充
 
-- [ ] 阶段 5：套用上述模式写一个自包含的 TCP echo server demo（待后续需求）
+- [ ] 阶段 5：套用上述模式写一个自包含的 TCP echo server demo（待后续需求，Windows IOCP 版本优先）
 - [ ] 阶段 6：集成到自己的项目（待领导安排项目方向）
-- [x] ~~补齐 `net/socket/` 目录源码~~：已在 `studysocket` 分支补齐，见第三章 3.5 节。核心是 [socket_posix.cc](net/socket/socket_posix.cc) 的 Reactor 实现。
 - [ ] 后续可深入：`TCPClientSocket` 的连接重试 / Happy Eyeballs（IPv4/IPv6 竞速）、`SSLClientSocket` 如何在 `StreamSocket` 之上分层加 TLS、`socket_pool` 的连接复用与限流。
+- [ ] Windows 专项：`TCPSocketDefaultWin`（旧 ObjectWatcher 实现）与 `TcpSocketIoCompletionPortWin`（新 IOCP）的迁移历史与性能对比；`udp_socket_win.cc` 的 IOCP 用法差异。
