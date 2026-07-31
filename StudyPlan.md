@@ -830,3 +830,115 @@ void Reset() override;
 - [ ] 后续深入：socket_pool 连接复用细节（idle 超时回收、preconnect 预连接、pending 队列优先级）
 - [ ] Windows 专项：`TCPSocketDefaultWin`（旧 ObjectWatcher 实现）与 `TcpSocketIoCompletionPortWin`（新 IOCP 实现）的迁移历史与性能对比
 - [ ] Windows 专项：`udp_socket_win.cc`（UDP 的 IOCP 实现与 TCP 的差异）
+
+---
+
+## 九、本次 net/socket 代码升级分析（提交 4ba3f2d）
+
+> 本仓库在 `studysocket` 分支基础上，对 `net/socket/` 做了一次整体升级（提交 `4ba3f2d Fix:新版本`，从 Chromium 主线同步最新实现）。本章分析 socket 层的具体变化与好处。
+
+### 9.1 新增文件（4 个）
+
+**1. [delayed_socket_config.h](file:///workspace/net/socket/delayed_socket_config.h) + [delayed_stream_socket.{h,cc}](file:///workspace/net/socket/delayed_stream_socket.h)**
+- **作用**：`StreamSocket` 的包装器，注入真实的网络延迟和带宽限制
+- **架构**（[头文件注释 L36-L87](file:///workspace/net/socket/delayed_stream_socket.h#L36-L87)）：
+  - 读路径：`OS Socket → [Download BottleneckBuffer] → Consumer`，缓冲满了就停止读 OS socket，自然形成 TCP 接收窗口收缩的背压
+  - 写路径：`Producer → [Upload BottleneckBuffer] → OS Socket`，缓冲满了 `Write()` 返回 `ERR_IO_PENDING`，从源头限流
+  - 延迟模型：Connect 延迟一个 RTT、每 chunk 标记半 RTT、`BandwidthThrottle` 处理带宽限制
+- **好处**：让测试能真实模拟慢速网络、高延迟链路，无需真实网络环境。**这正是第四章异步三段式与背压设计的完整演练场**——验证 `ERR_IO_PENDING` 退出 + 回调重入是否真的工作。
+
+**2. [read_multiple_emulator.{h,cc}](file:///workspace/net/socket/read_multiple_emulator.h)**
+- **作用**：用 `Read()` 模拟 `ReadMultiple()`（[头文件注释 L23-L29](file:///workspace/net/socket/read_multiple_emulator.h#L23-L29)）
+- **背景**：`QuicUseReadMultiple` feature 开启时，部分 DatagramClientSocket 还没原生实现 `ReadMultiple()`
+- **好处**：临时兼容，避免崩溃。标记为 TODO，等所有 socket 实现原生 `ReadMultiple()` 后删除。
+
+### 9.2 关键修改：连接建立路径的升级
+
+**1. Happy Eyeballs v2 与动态 IPv6 回退时间**（[transport_connect_job.cc#L413-L418](file:///workspace/net/socket/transport_connect_job.cc#L413-L418)）
+```cpp
+// 旧：静态常量 kIPv6FallbackTime = 300ms
+// 新：动态计算
+base::TimeDelta fallback_time = TcpConnectJob::GetIPv6FallbackTime(
+    common_connect_job_params(), params_.get());
+```
+- **变化**：IPv6 连接失败后启动 IPv4 备用连接的延迟时间，从静态 300ms 改为基于 RTT 估算（`kIPv6FallbackBasedOnRTT` feature）
+- **好处**：网络快时提前回退、网络慢时延后回退，比固定 300ms 更智能。**呼应学习笔记 6.5.4 节的 ConnectJob 抽象**——同一接口下升级建连策略，上层无感知。
+
+**2. Stale DNS 感知与禁用**（[tcp_connect_job.h#L426-L438](file:///workspace/net/socket/tcp_connect_job.h#L426-L438)、[ssl_connect_job.h](file:///workspace/net/socket/ssl_connect_job.h)）
+```cpp
+// tcp_connect_job.h 新增成员
+std::optional<bool> is_connected_via_stale_dns_;
+const bool disable_stale_dns_;
+// ssl_connect_job.h 新增成员
+bool is_connected_via_stale_dns_ = false;
+bool disable_stale_dns_ = false;
+```
+- **变化**：连接任务现在记录"是否用了过时 DNS 结果"，并支持"禁用过时 DNS"模式
+- **好处**：SSL 连接失败时可以用 fresh DNS 重试，避免因 DNS 缓存过期导致连到错误服务器。**这是连接可靠性的重要提升**。
+
+**3. ECH（Encrypted Client Hello）按域禁用**（[transport_connect_job.cc#L548-L556](file:///workspace/net/socket/transport_connect_job.cc#L548-L556)）
+```cpp
+// 新增 ssl_config_service 按域查询 EchMode
+ssl_client_context->ssl_config_service()->GetEchMode(
+    scheme_host_port->host()) == EchMode::kDisabled
+```
+- **变化**：ECH 现在可以按域名单独禁用（不只是全局开关）
+- **好处**：对不支持 ECH 或有兼容性问题的域名精准降级，不影响其他域名。
+
+### 9.3 关键修改：连接池管理的重构
+
+**1. `SocketPoolState` → `SocketPoolExpandability` 重命名**（[client_socket_pool.h#L427-L456](file:///workspace/net/socket/client_socket_pool.h#L427-L456)）
+```cpp
+// 旧：SocketPoolState state_ = SocketPoolState::kUncapped;
+// 新：SocketPoolExpandability expandability_ = SocketPoolExpandability::kUncapped;
+SocketPoolState StateForTest() const { return State(); }    // 旧
+SocketPoolExpandability ExpandabilityForTest() const { return Expandability(); }  // 新
+```
+- **变化**：把"池状态"概念重命名为"可扩展性"，语义更精确
+- **好处**：`State` 太泛（可指任何状态），`Expandability` 明确表达"池还能否新增 socket"这一具体语义。命名改进提升可读性。
+
+**2. `additional_capacity_` 从 const 变为可变**（[client_socket_pool.h#L455](file:///workspace/net/socket/client_socket_pool.h#L455)）
+```cpp
+const SocketPoolAdditionalCapacity additional_capacity_;    // 旧
+SocketPoolAdditionalCapacity additional_capacity_;          // 新
+```
+- 配套新增 `SetAdditionalCapacityForTest()`（[L372-L374](file:///workspace/net/socket/client_socket_pool.h#L372-L374)）
+- **好处**：运行时可以动态调整池的额外容量（之前只能在构造时设定）。便于测试和动态调优。
+
+**3. 构造函数简化：`additional_capacity` 不再是构造参数**（[transport_client_socket_pool.h#L155-L173](file:///workspace/net/socket/transport_client_socket_pool.h#L155-L173)）
+- 所有 pool 构造函数都移除了 `SocketPoolAdditionalCapacity additional_capacity` 参数
+- **好处**：构造时不需要决定容量策略，统一在构造后用 `SetAdditionalCapacityForTest()` 设置。降低构造复杂度。
+
+### 9.4 关键修改：WebSocket 端点锁的隔离增强
+
+**[websocket_endpoint_lock_manager.h](file:///workspace/net/socket/websocket_endpoint_lock_manager.h) 关键变化**：
+```cpp
+// 旧：EndpointLock(WebSocketEndpointLockManager*, const IPEndPoint&);
+// 新：EndpointLock(WebSocketEndpointLockManager*, const IPEndPoint&,
+//                 const NetworkAnonymizationKey&);
+void UnlockEndpoint(const IPEndPoint& endpoint);    // 旧
+void UnlockEndpoint(const IPEndPoint& endpoint,
+                    const NetworkAnonymizationKey& network_anonymization_key);  // 新
+```
+- **变化**：WebSocket 端点锁现在按 `IPEndPoint + NetworkAnonymizationKey` 双键区分
+- **好处**：**呼应学习笔记 6.5.2 节的 GroupId 分组复用**——WebSocket 同样遵守"不同网络隔离域不共享连接"的隐私约束。之前只按 IP 端点锁，可能导致不同 NAK 的请求互相阻塞；现在精确隔离，提升并发。
+
+### 9.5 升级对本项目（Windows 平台）的意义
+
+| 变化 | 对 Windows 项目的意义 |
+|------|---------------------|
+| `DelayedStreamSocket` | Windows IOCP 环境下可注入延迟/带宽限制做真实测试，验证 IOCP 的背压处理 |
+| `ReadMultipleEmulator` | UDP socket 若启用 `ReadMultiple`，Windows 版可用此模拟器临时兼容 |
+| 动态 IPv6 回退 | Windows 网络栈的 Happy Eyeballs 更智能 |
+| Stale DNS 感知 | Windows 下 SSL 连接失败可用 fresh DNS 重试，提升可靠性 |
+| `SocketPoolExpandability` | 命名改进提升 Windows 移植代码的可读性 |
+| WebSocket NAK 隔离 | Windows 下 WebSocket 连接池的隐私隔离更精确 |
+
+### 9.6 与学习笔记的呼应
+
+本次升级**正好印证了学习笔记里的几条核心设计**：
+
+- **checklist 第 25 条"ConnectJob 抽象建连"**：Happy Eyeballs v2 升级、Stale DNS 处理都是在 ConnectJob 内部演进，**上层 pool 和 HttpStreamFactory 完全无感知**——这正是分层抽象的价值。
+- **checklist 第 24 条"socket 池化 + 分组复用"**：WebSocket 端点锁加入 NetworkAnonymizationKey，是 GroupId 分组思想在 WebSocket 层的延伸。
+- **6.5.3 节"RequestSocket 复用优先"**：`SocketPoolExpandability` 重命名让"池能否扩展"这一复用决策语义更清晰。
+- **第四章"异步三段式"**：`DelayedStreamSocket` 是三段式 + 背压设计的大规模演练，可作学习样本。
