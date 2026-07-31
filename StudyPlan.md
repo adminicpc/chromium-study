@@ -616,34 +616,159 @@ rv = connection->socket()->Read(read_buf, read_buf->RemainingCapacity(), ...);
 
 ### 6.5 Chromium 调用链路
 
-前面 6.1-6.4 是 `net/server` 的"服务器侧"用法（直接 `Accept`）。真实的 Chromium 浏览器是"客户端侧"——发起 HTTP 请求时，从 `URLRequest` 到 syscall 要经过一长串调用链。本节梳理这条链路。
+> **重要说明**：本仓库（提交 `4ba3f2d` 及以后）的 net/ 已经升级到 Chromium 较新版本，**网络栈正处在新旧两套架构并存、逐步迁移到新架构的过渡期**。旧链路（HttpStreamFactory::Job + ClientSocketPool + ConnectJob）仍在工作，新链路（HttpStreamPool + StreamAttempt）在特定条件下启用。学习时务必同时理解两套，否则看代码会混乱。
+>
+> 之前 6.5 只描述旧架构，本次重写补全新架构、WebSocket、QUIC、Windows 实现选择等所有路径。
 
-#### 6.5.1 完整调用栈图
+#### 6.5.1 新旧架构并存与切换条件
 
-```
-URLRequest::Start()
-  └─ HttpStreamFactory::Job::DoLoop()
-       └─ DoInitConnectionImplHttp()                          // 选 socket 池
-            └─ InitSocketHandleForHttpRequest()               // client_socket_pool_manager.cc L214
-                 └─ InitSocketPoolHelper()                    // L81 构造 GroupId + 选 pool
-                      └─ ClientSocketHandle::Init()           // client_socket_handle.cc L31
-                           └─ ClientSocketPool::RequestSocket()
-                                ├─ 查 idle 健康队列 → 命中则直接返回（复用）
-                                ├─ 未达上限 → 创建 ConnectJob
-                                │    └─ ConnectJob::Connect()
-                                │         ├─ HostResolver::Resolve()    // DNS
-                                │         ├─ ClientSocketFactory::CreateTransportClientSocket()
-                                │         │    └─ TCPClientSocket → TCPSocket → syscall connect()
-                                │         └─ (若 https) SSLClientSocket::Connect()  // TLS 握手
-                                └─ 达上限 → 进 pending 队列等别人释放
-       └─ (连接就绪后) HttpStreamParser::SendRequest / ReadResponseHeaders
-            └─ stream_socket_->Write() / Read()               // http_stream_parser.cc L451/L594
-                 └─ TCPSocket → SocketPosix/CoreImpl → syscall
-  └─ (用完) ClientSocketHandle::Reset()                       // client_socket_handle.cc L74
-       └─ pool_->ReleaseSocket()（健康）或 socket()->Disconnect()（坏连接）
+**新架构启用条件**（[http_stream_factory_job_controller.cc#L904-L907](file:///workspace/net/http/http_stream_factory_job_controller.cc#L904-L907)）：
+
+```cpp
+if (session_->host_resolver()->IsHappyEyeballsV3Enabled() &&
+    proxy_info_.is_direct() && !is_websocket_ &&
+    request_info_.socket_tag == SocketTag()) {
+  SwitchToHttpStreamPool();
+}
 ```
 
-#### 6.5.2 三层池化 + GroupId 分组
+四个条件**全部满足**才切到新架构（HttpStreamPool）：
+1. Happy Eyeballs v3 启用（新 DNS 选择算法）
+2. 直连（非代理）
+3. 非 WebSocket
+4. 没有 SocketTag（Android 网络隔离标签）
+
+**走旧架构的情况**：代理连接、WebSocket、有 SocketTag、或 HappyEyeballsV3 未启用。
+
+[http_stream_request.h#L223-L230](file:///workspace/net/http/http_stream_request.h#L223-L230) 的 TODO 直接说明过渡目标：
+
+```
+// HttpStreamFactory::JobController performs proxy resolution for a request.
+// Ideally we should separate proxy resolution from HttpStreamFactory::JobController
+// and use HttpStreamPool directly from HttpNetworkTransaction.
+// TODO(crbug.com/346835898): Remove this method once we come up with a way...
+```
+
+也就是：HttpStreamFactory::JobController 现在只是"代理解析 + 转发到 HttpStreamPool"的外壳，最终目标是 HttpNetworkTransaction 直接调 HttpStreamPool。
+
+#### 6.5.2 完整调用栈图（新版，含新架构和 Windows 实现）
+
+```
+HttpNetworkTransaction::Start()
+  └─ HttpStreamFactory::RequestStream()
+       └─ HttpStreamFactory::JobController::CreateJobController()
+            │
+            ├─ 满足 6.5.1 四条件 ─────────────────────────────────┐
+            │   → SwitchToHttpStreamPool()                         │ 新架构
+            │                                                      ▼
+            │  HttpStreamPool::RequestStream()  (http_stream_pool.cc)
+            │     └─ HttpStreamPool::AttemptManager::CreateAttempt()
+            │          └─ HttpStreamPool::Attempt           (http_stream_pool_attempt.cc L48)
+            │               └─ Attempt::TcpAttempt           (L48-L61)
+            │                    ├─ using_tls=true  → TlsStreamAttempt (TLS over TCP)
+            │                    └─ using_tls=false → TcpStreamAttempt  (纯 TCP)
+            │                         └─ StreamAttempt::Start()
+            │                              └─ ClientSocketFactory::CreateTransportClientSocket()
+            │                                   └─ TCPClientSocket
+            │                                        ├─ [Windows] TCPSocketWin
+            │                                        │    ├─ TcpSocketIoCompletionPortWin (IOCP，feature 默认关闭)
+            │                                        │    └─ TCPSocketDefaultWin          (ObjectWatcher+WSAEvent，默认)
+            │                                        │         └─ Winsock syscall
+            │                                        └─ [POSIX]  TCPSocketPosix → SocketPosix → epoll
+            │
+            └─ 不满足条件（代理/WebSocket/SocketTag/HappyEyeballsV3 off）──┐
+                → 走旧架构                                                  │
+                                                                            ▼
+                InitSocketHandleForHttpRequest()   (client_socket_pool_manager.cc L214)
+                  └─ InitSocketPoolHelper()       (L81 构造 GroupId + 选 pool)
+                       └─ ClientSocketHandle::Init()  (client_socket_handle.cc L31)
+                            └─ ClientSocketPool::RequestSocket()
+                                 ├─ 查 idle 健康队列 → 命中则直接返回（复用）
+                                 ├─ 未达上限 → 创建 ConnectJob
+                                 │    └─ ConnectJob::Connect()
+                                 │         ├─ HostResolver::Resolve()    // DNS
+                                 │         ├─ ClientSocketFactory::CreateTransportClientSocket()
+                                 │         │    └─ TCPClientSocket → TCPSocket → syscall connect()
+                                 │         └─ (若 https) SSLClientSocket::Connect()  // TLS 握手
+                                 └─ 达上限 → 进 pending 队列等别人释放
+
+  连接就绪后：
+  HttpStreamParser::SendRequest / ReadResponseHeaders  (http_stream_parser.cc L451/L594)
+    └─ stream_socket_->Write() / Read()
+         └─ TCPSocket → SocketPosix/CoreImpl → syscall
+  (用完) ClientSocketHandle::Reset()  (client_socket_handle.cc L74)
+    └─ pool_->ReleaseSocket()（健康）或 socket()->Disconnect()（坏连接）
+```
+
+**新旧架构的差异要点**：
+- 旧架构用 `ConnectJob` 抽象建连（TransportConnectJob/SSLConnectJob/代理 Job 串联）
+- 新架构用 `StreamAttempt` 抽象建连（TcpStreamAttempt/TlsStreamAttempt）
+- 两者最终都通过 `ClientSocketFactory` 创建底层 `TCPClientSocket`，**底层 socket 实现完全共享**
+- 旧架构的池化是 `ClientSocketPool`（per-group idle 队列 + ConnectJob）
+- 新架构的池化是 `HttpStreamPool`（per-key idle 队列 + Attempt）
+
+#### 6.5.3 新架构组件详解
+
+**[HttpStreamPool](file:///workspace/net/http/http_stream_pool.h#L40-L47)**（2024 年引入，net/http/ 下）：
+- 注释明确："Manages in-flight HTTP stream requests and maintains idle stream sockets. Restricts the number of streams open at a time. HttpStreams are grouped by HttpStreamKey."
+- 当前限制："Currently only supports non-proxy streams"（这也是 6.5.1 切换条件之一）
+
+**[StreamAttempt](file:///workspace/net/socket/stream_attempt.h#L54-L60)**（2024 年引入，net/socket/ 下）：
+- 注释："Represents a TCP or TLS connection attempt to a single IP endpoint."
+- 是 `TcpStreamAttempt` 和 `TlsStreamAttempt` 的基类
+- 设计与 `ConnectJob` 类似：异步任务抽象，发起连接 + 回调通知
+
+**[HttpStreamPool::Attempt](file:///workspace/net/http/http_stream_pool_attempt.h#L34-L40)**（2026 年，net/http/ 下）：
+- 注释："Represents a single in-flight attempt which can make at most two concurrent TCP-based inner attempts (one IPv4, one IPv6)."
+- 内部 spawn `TcpAttempt`（[http_stream_pool_attempt.cc#L48-L61](file:///workspace/net/http/http_stream_pool_attempt.cc#L48-L61)）：
+  ```cpp
+  class HttpStreamPool::Attempt::TcpAttempt {
+    if (owner_->using_tls_) {
+      attempt_ = std::make_unique<TlsStreamAttempt>(...);  // TLS over TCP
+    } else {
+      attempt_ = std::make_unique<TcpStreamAttempt>(...);   // 纯 TCP
+    }
+  }
+  ```
+- "In the future, this may also handle QUIC inner attempts." —— QUIC 路径目前还不走新架构
+
+**新架构的层次**：
+```
+HttpNetworkSession
+  ├─ http_stream_factory_   (旧：HttpStreamFactory)
+  └─ http_stream_pool_      (新：HttpStreamPool)
+                              ├─ AttemptManager
+                              │    └─ Attempt（IPv4+IPv6 并发，最多 2 个）
+                              │         └─ TcpAttempt
+                              │              ├─ TlsStreamAttempt（HTTPS）
+                              │              └─ TcpStreamAttempt（HTTP）
+                              └─ idle stream sockets（按 HttpStreamKey 分组）
+```
+
+#### 6.5.4 旧架构组件详解（保留作对照）
+
+**`HttpStreamFactory::Job`** —— 旧建连任务，分多个子类型：
+- `HttpStreamFactory::Job::DoInitConnectionImplHttp()` —— 选 socket 池
+- 处理代理、备选服务（Alt-Svc）、QUIC fallback 等复杂逻辑
+
+**`ConnectJob`** —— 旧建连抽象，子类：
+- `TransportConnectJob`：DNS 解析 + TCP connect（**9.2 节记录的 Happy Eyeballs v2 升级、Stale DNS、ECH 按域禁用全在这里**）
+- `SSLConnectJob`：在 TransportConnectJob 之上加 TLS 握手
+- `HttpProxyConnectJob` / `SOCKSConnectJob`：代理隧道
+
+**`ClientSocketPool`** —— 旧池化（详见 6.5.5、6.5.6）：
+- per-GroupId idle 队列 + ConnectJob + pending 队列
+
+**新旧对照**：
+| 维度 | 旧架构 | 新架构 |
+|------|--------|--------|
+| 建连抽象 | ConnectJob | StreamAttempt |
+| 池化 | ClientSocketPool | HttpStreamPool |
+| 分组键 | GroupId（6 维） | HttpStreamKey |
+| 适用 | 代理/WebSocket/SocketTag | 直连 |
+| 并发建连 | 单 ConnectJob 内部 Happy Eyeballs | Attempt 内最多 2 个 TcpAttempt |
+
+#### 6.5.5 三层池化 + 分组（旧架构）
 
 **第一层：ClientSocketPoolManager 按 proxy chain 选 pool**。[InitSocketPoolHelper](file:///workspace/net/socket/client_socket_pool_manager.cc#L81-L133)（L81-L133）：
 
@@ -675,7 +800,9 @@ ClientSocketPool::GroupId connection_group(
 
 GroupId 由 6 个维度组成：`SchemeHostPort`（目的地址）+ `PrivacyMode`（隐私模式）+ `NetworkAnonymizationKey`（网络隔离键）+ `SecureDnsPolicy`（DoH 策略）+ `disable_cert_network_fetches` + `target_network`。只有这 6 维全相同的请求才被视为"可互换"，能复用彼此的 socket。
 
-#### 6.5.3 RequestSocket 复用优先
+**新架构的 HttpStreamKey 起同样作用**，只是简化了维度（详见 [http_stream_key.h](file:///workspace/net/http/http_stream_key.h)）。
+
+#### 6.5.6 RequestSocket 复用优先（旧架构）
 
 [ClientSocketHandle::Init](file:///workspace/net/socket/client_socket_handle.cc#L31-L61)（L31-L61）把请求交给 pool：
 
@@ -697,16 +824,9 @@ pool 内部 `RequestSocket` 的三路决策：
 
 `IdleSocket::IsUsable` 的健康检查（[L114-L115](file:///workspace/net/socket/transport_client_socket_pool.cc#L114-L115)）关键规则：**用过的 socket 如果收到非预期数据则不健康**（脏数据会被误认为下一个响应的开头）。但从未用过的 preconnect socket 即使有未读数据也可用（可能是 SPDY SETTINGS 帧）。
 
-#### 6.5.4 ConnectJob 抽象建连
+**新架构的 HttpStreamPool 行为类似**：先查 idle，未命中再 spawn Attempt。
 
-`ConnectJob` 把"建连"封装成异步任务，对 pool 隐藏细节：
-- `TransportConnectJob`：DNS 解析 + TCP connect
-- `SSLConnectJob`：在 TransportConnectJob 之上加 TLS 握手
-- `HttpProxyConnectJob` / `SOCKSConnectJob`：代理隧道
-
-分层 Job 串联：底层 Job 完成（TCP 通了）→ 上层 Job 接管（SSL 握手）→ 全部完成才交给 pool。pool 只管"给我一个连好的 socket"，不关心中间经过几层。
-
-#### 6.5.5 Handle 解耦
+#### 6.5.7 Handle 解耦
 
 上层（`HttpStreamFactory::Job`）持 `unique_ptr<ClientSocketHandle>`，不直接持有 socket。[client_socket_handle.h#L39-L44](file:///workspace/net/socket/client_socket_handle.h#L39-L44) 的类注释：
 
@@ -720,7 +840,9 @@ pool 内部 `RequestSocket` 的三路决策：
 
 Handle 是上层和 pool 之间的"中间人"：上层用 Handle 拿 socket、用完通过 Handle 还给 pool。Handle 的 `Init`（[L83-L93](file:///workspace/net/socket/client_socket_handle.h#L83-L93)）向 pool 请求，`Reset`（[L101-L109](file:///workspace/net/socket/client_socket_handle.h#L101-L109)）归还。这种解耦让上层不感知池化细节，pool 也不感知上层的业务逻辑。
 
-#### 6.5.6 IO 阶段 HttpStreamParser 复用三段式
+**新架构对应的是 [HttpStreamPoolHandle](file:///workspace/net/http/http_stream_pool_handle.h)**，作用类似。
+
+#### 6.5.8 IO 阶段 HttpStreamParser 复用三段式
 
 连接建立后进入 HTTP 收发阶段，[HttpStreamParser](file:///workspace/net/http/http_stream_parser.cc) 复用 socket 的三段式 IO：
 
@@ -753,9 +875,9 @@ int HttpBasicStream::ReadResponseBody(...) {
 }
 ```
 
-注意这里 `stream_socket_` 就是前面 pool 给的 socket（可能是复用的），上层完全无感知是新建还是复用——**池化对 IO 代码透明**。
+注意这里 `stream_socket_` 就是前面 pool 给的 socket（可能是复用的），上层完全无感知是新建还是复用、走的是新架构还是旧架构——**池化对 IO 代码透明**。
 
-#### 6.5.7 Reset 双语义
+#### 6.5.9 Reset 双语义
 
 用完连接后调 [Reset](file:///workspace/net/socket/client_socket_handle.h#L101-L109)（L101-L109），注释点明两种语义：
 
@@ -774,17 +896,78 @@ void Reset() override;
 - **健康归还**（keep-alive 复用）：socket 没出错，`Reset` 把 socket 还给 pool 的 idle 队列，下次同 group 请求可复用。走 [ResetInternal](file:///workspace/net/socket/client_socket_handle.cc#L172-L208) 的 `pool_->ReleaseSocket`（[L184](file:///workspace/net/socket/client_socket_handle.cc#L184)）。
 - **坏连接主动 Disconnect**：socket 出错了，调 `ResetAndCloseSocket`（[L79-L85](file:///workspace/net/socket/client_socket_handle.cc#L79-L85)），先 `socket()->Disconnect()`（[L81](file:///workspace/net/socket/client_socket_handle.cc#L81)）再 reset，pool 收到的是已断开的 socket，直接删除不进 idle 队列。**防止坏连接污染池**。
 
-#### 6.5.8 设计要点表
+#### 6.5.10 WebSocket 独立链路
 
-| 设计 | 作用 |
-|------|------|
-| 三层池化（Manager / Pool / Group） | 按 proxy / origin 维度隔离，复用粒度精确 |
-| GroupId 六维分组 | 同 origin + 同隐私/隔离策略的请求才复用，避免信息泄漏 |
-| idle 健康检查 | 脏数据 socket 不复用，preconnect socket 宽容 |
-| ConnectJob 抽象 | pool 不关心建连细节（DNS/TCP/SSL/代理），只拿结果 |
-| Handle 中间人 | 上层与 pool 解耦，上层只管用和还 |
-| Reset 双语义 | 健康归还复用、坏连接 Disconnect 防污染 |
-| IO 阶段透明 | HttpStreamParser 不感知 socket 是新建还是复用 |
+WebSocket 是**完全独立**的链路，不走 6.5.1 的两条主链路：
+
+**关键证据**（[client_socket_pool_manager_impl.cc#L30-L40](file:///workspace/net/socket/client_socket_pool_manager_impl.cc#L30-L40)）：
+
+```cpp
+const CommonConnectJobParams& common_connect_job_params,
+const CommonConnectJobParams& websocket_common_connect_job_params,  // 独立的一套！
+```
+
+WebSocket 专属组件：
+- `WebSocketTransportClientSocketPool`（[继承自 ClientSocketPool](file:///workspace/net/socket/websocket_transport_client_socket_pool.h#L41)）
+- `websocket_endpoint_lock_manager`（**9.4 节记录的本次升级修改的文件**：端点锁加入 `NetworkAnonymizationKey` 双键）
+- 独立的 `websocket_common_connect_job_params_`
+
+**为什么独立**：WebSocket 长连接特性与 HTTP 复用模型不同。HTTP 用完归还 idle 池让下个请求复用；WebSocket 是长连独占，且需要 endpoint lock 防止多个连接同时连同一 IP（TCP 公平性）。
+
+**触发条件**：`is_websocket_ = true` 时强制走旧架构 + 独立池（见 6.5.1）。
+
+#### 6.5.11 QUIC 路径
+
+QUIC 走 UDP，完全不同的 socket 创建和"连接"语义：
+
+- `QuicSessionPool` 管理 QUIC 会话（[http_network_session.h](file:///workspace/net/http/http_network_session.h)）
+- QUIC 用 `DatagramClientSocket`（不是 `StreamSocket`）
+- HttpStreamFactory::Job 会尝试 QUIC（备选服务 Alt-Svc）+ TCP 并行，QUIC 成功则用 QUIC
+- 新架构的 `HttpStreamPool::QuicAttempt`（[http_stream_pool_quic_attempt.h](file:///workspace/net/http/http_stream_pool_quic_attempt.h)）正在加入，注释说未来会处理 QUIC inner attempt
+
+#### 6.5.12 Windows socket 实现选择：Default vs IOCP
+
+Windows 上 `TCPClientSocket` 内部用 `TCPSocketWin`，而 `TCPSocketWin` 有两种实现：
+
+**默认实现 `TCPSocketDefaultWin`**：用 `WSAEventSelect` + `base::ObjectWatcher` 监听网络事件，事件到达后 PostTask 到线程做实际 IO。
+
+**IOCP 实现 `TcpSocketIoCompletionPortWin`**（[tcp_socket_io_completion_port_win.h#L21-L24](file:///workspace/net/socket/tcp_socket_io_completion_port_win.h#L21-L24)）：
+
+```cpp
+// An implementation of TCPSocketWin which uses an IO completion port to be
+// notified of completed reads and writes. The goal is to avoid the PostTask
+// overhead associated with the use of base::ObjectWatcher in
+// TCPSocketDefaultWin.
+class NET_EXPORT TcpSocketIoCompletionPortWin : public TCPSocketWin {
+```
+
+**关键点**：IOCP 版本的目标是**消除 `ObjectWatcher` 的 PostTask 开销**——IOCP 完成包直接在线程池回调，避免多一次任务投递。
+
+**Feature flag 状态**（[features.cc#L308](file:///workspace/net/base/features.cc#L308)）：
+
+```cpp
+BASE_FEATURE(kTcpSocketIoCompletionPortWin, base::FEATURE_DISABLED_BY_DEFAULT);
+```
+
+**默认关闭**！目前生产仍走 `TCPSocketDefaultWin`，IOCP 版本在逐步推进。**这就是 3.6 节 Windows IOCP 实现细节的实战落点**——如果你的项目要启用 IOCP 性能优化，需要打开这个 flag 并验证。
+
+#### 6.5.13 设计要点表（更新）
+
+| 设计 | 作用 | 出现位置 |
+|------|------|----------|
+| 新旧架构并存 + 渐进迁移 | 不破坏旧路径的前提下推进新设计，符合 Chromium 演进哲学 | 6.5.1 |
+| StreamAttempt 替代 ConnectJob | 更细粒度的单连接建连抽象，便于 IPv4/IPv6 并发 | 6.5.3 |
+| HttpStreamPool::Attempt 并发两路 | IPv4 + IPv6 同时尝试，第一个成功即用 | 6.5.3 |
+| 三层池化（Manager / Pool / Group） | 按 proxy / origin 维度隔离，复用粒度精确 | 6.5.5 |
+| GroupId 六维分组 | 同 origin + 同隐私/隔离策略的请求才复用，避免信息泄漏 | 6.5.5 |
+| idle 健康检查 | 脏数据 socket 不复用，preconnect socket 宽容 | 6.5.6 |
+| ConnectJob 抽象（旧）/ StreamAttempt（新） | pool 不关心建连细节，只拿结果 | 6.5.4 |
+| Handle 中间人 | 上层与 pool 解耦，上层只管用和还 | 6.5.7 |
+| Reset 双语义 | 健康归还复用、坏连接 Disconnect 防污染 | 6.5.9 |
+| WebSocket 独立链路 | 长连独占 + endpoint lock，与 HTTP 复用模型不同 | 6.5.10 |
+| QUIC 走 UDP 独立栈 | 不同传输层语义，DatagramClientSocket + QuicSessionPool | 6.5.11 |
+| Windows IOCP feature flag | 默认关闭，避免 PostTask 开销 | 6.5.12 |
+| IO 阶段透明 | HttpStreamParser 不感知 socket 是新建还是复用、新架构还是旧架构 | 6.5.8 |
 
 ---
 
