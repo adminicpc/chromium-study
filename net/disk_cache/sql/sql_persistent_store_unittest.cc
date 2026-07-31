@@ -36,12 +36,14 @@
 #include "net/base/cache_type.h"
 #include "net/base/features.h"
 #include "net/base/io_buffer.h"
+#include "net/disk_cache/backend_cleanup_tracker.h"
 #include "net/disk_cache/memory_entry_data_hints.h"
 #include "net/disk_cache/simple/simple_util.h"
 #include "net/disk_cache/sql/cache_entry_key.h"
 #include "net/disk_cache/sql/entry_write_buffer.h"
 #include "net/disk_cache/sql/sql_async_task_manager.h"
 #include "net/disk_cache/sql/sql_backend_constants.h"
+#include "net/disk_cache/sql/sql_persistent_store_backend.h"
 #include "net/disk_cache/sql/sql_persistent_store_backend_shard.h"
 #include "sql/database.h"
 #include "sql/meta_table.h"
@@ -78,11 +80,7 @@ class SqlPersistentStoreTestBase : public testing::Test {
   }
 
   // Cleans up the store and ensures all background tasks are completed.
-  void TearDown() override {
-    store_.reset();
-    // Make sure all background tasks are done before returning.
-    FlushPendingTask();
-  }
+  void TearDown() override { ClearStore(); }
 
  protected:
   // Returns the path to the temporary directory.
@@ -95,11 +93,17 @@ class SqlPersistentStoreTestBase : public testing::Test {
 
   // Creates a SqlPersistentStore instance.
   void CreateStore(int64_t max_bytes = kDefaultMaxBytes) {
+    if (store_ || cleanup_tracker_) {
+      ClearStore();
+    }
+    cleanup_tracker_ = BackendCleanupTracker::TryCreate(temp_dir_.GetPath(),
+                                                        base::DoNothing());
+    CHECK(cleanup_tracker_);
     store_ = std::make_unique<SqlPersistentStore>(
         GetTempPath(), max_bytes, net::CacheType::DISK_CACHE,
         std::vector<scoped_refptr<base::SequencedTaskRunner>>(
             background_task_runners_),
-        async_task_manager_);
+        async_task_manager_, cleanup_tracker_);
   }
 
   // Initializes the store and waits for the operation to complete.
@@ -115,17 +119,23 @@ class SqlPersistentStoreTestBase : public testing::Test {
   }
 
   void ClearStore() {
-    CHECK(store_);
-    store_.reset();
+    if (store_) {
+      store_.reset();
+    }
     FlushPendingTask();
+    if (cleanup_tracker_) {
+      base::RunLoop run_loop;
+      cleanup_tracker_->AddPostCleanupCallback(run_loop.QuitClosure());
+      cleanup_tracker_ = nullptr;
+      run_loop.Run();
+    }
   }
 
   // Helper function to create, initialize, and then close a store.
   void CreateAndCloseInitializedStore() {
     CreateStore();
     ASSERT_EQ(Init(), SqlPersistentStore::Error::kOk);
-    store_.reset();
-    FlushPendingTask();
+    ClearStore();
   }
 
   // Makes the database file unwritable to test error handling.
@@ -729,13 +739,14 @@ class SqlPersistentStoreTestBase : public testing::Test {
  protected:
   virtual bool IsWalModeEnabled() const = 0;
 
+  base::test::ScopedFeatureList feature_list_;
   base::test::TaskEnvironment task_environment_{
       base::test::TaskEnvironment::TimeSource::MOCK_TIME};
-  base::test::ScopedFeatureList feature_list_;
   base::ScopedTempDir temp_dir_;
   std::vector<scoped_refptr<base::SequencedTaskRunner>>
       background_task_runners_;
   SqlAsyncTaskManager async_task_manager_;
+  scoped_refptr<BackendCleanupTracker> cleanup_tracker_;
   std::unique_ptr<SqlPersistentStore> store_;
   std::unique_ptr<base::FilePermissionRestorer> file_permissions_restorer_;
 };
@@ -778,6 +789,22 @@ TEST_P(SqlPersistentStoreTest, InitExisting) {
   // Create a new store with the same path, which should open the existing DB.
   CreateStore();
   EXPECT_EQ(Init(), SqlPersistentStore::Error::kOk);
+}
+
+TEST_P(SqlPersistentStoreTest, ReduceUma) {
+  base::test::ScopedFeatureList feature_list;
+  feature_list.InitAndEnableFeatureWithParameters(
+      net::features::kDiskCacheBackendExperiment,
+      {{"SqlDiskCacheReduceUma", "true"}});
+
+  base::HistogramTester histogram_tester;
+  CreateStore(10 * 1024 * 1024);
+  EXPECT_EQ(Init(), SqlPersistentStore::Error::kOk);
+
+  histogram_tester.ExpectTotalCount(
+      "Net.SqlDiskCache.Backend.Initialize.SuccessTime", 0);
+  histogram_tester.ExpectTotalCount(
+      "Net.SqlDiskCache.Backend.Initialize.Result", 0);
 }
 
 TEST_P(SqlPersistentStoreTest, SerialInitialize) {
@@ -854,11 +881,16 @@ TEST_P(SqlPersistentStoreTest, InitFailsWithCreationDirectoryFailure) {
   base::FilePath db_dir_path = GetTempPath().Append(FILE_PATH_LITERAL("db"));
   ASSERT_TRUE(base::WriteFile(db_dir_path, ""));
 
+  CHECK(!store_);
+  CHECK(!cleanup_tracker_);
+  cleanup_tracker_ =
+      BackendCleanupTracker::TryCreate(db_dir_path, base::DoNothing());
+  CHECK(cleanup_tracker_);
   store_ = std::make_unique<SqlPersistentStore>(
       db_dir_path, kDefaultMaxBytes, net::CacheType::DISK_CACHE,
       std::vector<scoped_refptr<base::SequencedTaskRunner>>(
           background_task_runners_),
-      async_task_manager_);
+      async_task_manager_, cleanup_tracker_);
   ASSERT_EQ(Init(), SqlPersistentStore::Error::kFailedToCreateDirectory);
 }
 
@@ -871,6 +903,88 @@ TEST_P(SqlPersistentStoreTest, InitFailsWithUnwritableFile) {
 
   CreateStore();
   ASSERT_EQ(Init(), SqlPersistentStore::Error::kFailedToOpenDatabase);
+}
+
+// Tests that SqlPersistentStore::Backend::Initialize fails if the database was
+// created with a different shared_cache_enabled setting.
+TEST_P(SqlPersistentStoreTest, SharedCacheEnabledMismatch) {
+  const base::FilePath db_path = GetTempPath();
+
+  // Initialize backend with shared_cache_enabled = true.
+  {
+    SqlPersistentStore::Backend backend(SqlPersistentStore::ShardId(0), db_path,
+                                        net::CacheType::DISK_CACHE,
+                                        /*shared_cache_enabled=*/true,
+                                        /*read_cache_memory_monitor=*/nullptr);
+    auto init_result =
+        backend.Initialize(kDefaultMaxBytes, base::TimeTicks::Now());
+    ASSERT_TRUE(init_result.has_value());
+  }
+
+  // Initializing backend with shared_cache_enabled = false on the same database
+  // should fail with kSharedCacheEnabledMismatch.
+  {
+    SqlPersistentStore::Backend backend(SqlPersistentStore::ShardId(0), db_path,
+                                        net::CacheType::DISK_CACHE,
+                                        /*shared_cache_enabled=*/false,
+                                        /*read_cache_memory_monitor=*/nullptr);
+    auto init_result =
+        backend.Initialize(kDefaultMaxBytes, base::TimeTicks::Now());
+    ASSERT_FALSE(init_result.has_value());
+    EXPECT_EQ(init_result.error(),
+              SqlPersistentStore::Error::kSharedCacheEnabledMismatch);
+  }
+}
+
+// Tests that initializing an existing database that lacks the
+// kSqlBackendMetaTableKeySharedCacheEnabled metadata key fails if
+// shared_cache_enabled is true, and succeeds if shared_cache_enabled is false.
+TEST_P(SqlPersistentStoreTest, SharedCacheEnabledAbsentInOldDatabase) {
+  const base::FilePath db_path = GetTempPath();
+
+  // Create an existing database and meta table without setting
+  // kSqlBackendMetaTableKeySharedCacheEnabled.
+  {
+    auto db = std::make_unique<sql::Database>(
+        sql::DatabaseOptions()
+#if BUILDFLAG(IS_WIN)
+            .set_exclusive_database_file_lock(true)
+#endif
+            .set_wal_mode(IsWalModeEnabled()),
+        sql::Database::Tag("HttpCacheDiskCache"));
+    ASSERT_TRUE(db->Open(GetDatabaseFilePath()));
+    sql::MetaTable meta_table;
+    ASSERT_TRUE(meta_table.Init(db.get(), kSqlBackendCurrentDatabaseVersion,
+                                kSqlBackendCompatibleDatabaseVersion));
+    ASSERT_TRUE(meta_table.SetValue(kSqlBackendMetaTableKeyEntryCount, 0));
+    ASSERT_TRUE(meta_table.SetValue(kSqlBackendMetaTableKeyTotalSize, 0));
+  }
+
+  // Initializing backend with shared_cache_enabled = true on an old DB without
+  // the shared cache metadata key should fail with kSharedCacheEnabledMismatch.
+  {
+    SqlPersistentStore::Backend backend(SqlPersistentStore::ShardId(0), db_path,
+                                        net::CacheType::DISK_CACHE,
+                                        /*shared_cache_enabled=*/true,
+                                        /*read_cache_memory_monitor=*/nullptr);
+    auto init_result =
+        backend.Initialize(kDefaultMaxBytes, base::TimeTicks::Now());
+    ASSERT_FALSE(init_result.has_value());
+    EXPECT_EQ(init_result.error(),
+              SqlPersistentStore::Error::kSharedCacheEnabledMismatch);
+  }
+
+  // Initializing backend with shared_cache_enabled = false on the old DB should
+  // succeed.
+  {
+    SqlPersistentStore::Backend backend(SqlPersistentStore::ShardId(0), db_path,
+                                        net::CacheType::DISK_CACHE,
+                                        /*shared_cache_enabled=*/false,
+                                        /*read_cache_memory_monitor=*/nullptr);
+    auto init_result =
+        backend.Initialize(kDefaultMaxBytes, base::TimeTicks::Now());
+    EXPECT_TRUE(init_result.has_value());
+  }
 }
 
 // Tests the recovery mechanism when the database file is corrupted.
@@ -4560,11 +4674,16 @@ int SqlPersistentStoreTestBase::GetNumberForWritesRequiredForCheckpoint(
     std::string_view data) {
   base::ScopedTempDir temp_dir;
   CHECK(temp_dir.CreateUniqueTempDir());
+  CHECK(!store_);
+  CHECK(!cleanup_tracker_);
+  cleanup_tracker_ =
+      BackendCleanupTracker::TryCreate(temp_dir.GetPath(), base::DoNothing());
+  CHECK(cleanup_tracker_);
   store_ = std::make_unique<SqlPersistentStore>(
       temp_dir.GetPath(), kDefaultMaxBytes, net::CacheType::DISK_CACHE,
       std::vector<scoped_refptr<base::SequencedTaskRunner>>(
           background_task_runners_),
-      async_task_manager_);
+      async_task_manager_, cleanup_tracker_);
   CHECK_EQ(Init(), SqlPersistentStore::Error::kOk);
 
   const base::FilePath db_path =
@@ -4597,8 +4716,7 @@ int SqlPersistentStoreTestBase::GetNumberForWritesRequiredForCheckpoint(
     EXPECT_GT(wal_size, previous_wal_size);
     previous_wal_size = wal_size;
   }
-  store_.reset();
-  FlushPendingTask();
+  ClearStore();
   return number_of_writes;
 }
 
@@ -4663,12 +4781,7 @@ void SqlPersistentStoreTestBase::RunWalCheckpointTest(bool serial_checkpoint,
   // greater than in an idle state.
   EXPECT_GT(non_idle_checkpoint_write_count, idle_checkpoint_write_count);
 
-  store_ = std::make_unique<SqlPersistentStore>(
-      GetTempPath(), kDefaultMaxBytes, net::CacheType::DISK_CACHE,
-      std::vector<scoped_refptr<base::SequencedTaskRunner>>(
-          background_task_runners_),
-      async_task_manager_);
-  CHECK_EQ(Init(), SqlPersistentStore::Error::kOk);
+  CreateAndInitStore();
   const base::FilePath db_path = GetDatabaseFilePath();
   int64_t previous_db_size = CheckedGetFileSize(db_path);
 
@@ -5725,6 +5838,43 @@ TEST_P(SqlPersistentStoreTest, DoomEntryRecoversIndexOnDbFailure) {
   open_result = OpenEntry(kKey);
   ASSERT_TRUE(open_result.has_value());
   EXPECT_FALSE(open_result->has_value());
+}
+
+// Tests that when `DoomEntry` is called with a `res_id` that is present in the
+// in-memory index for the key's hash bucket but belongs to a different
+// `cache_key` in the database (so the operation returns `kNotFound`), the
+// optimistic in-memory index removal is rolled back to keep the index
+// consistent with the database.
+TEST_P(SqlPersistentStoreTest, DoomEntryRecoversIndexOnNotFound) {
+  CreateAndInitStore();
+  ASSERT_TRUE(LoadInMemoryIndex());
+
+  // Two distinct keys with the same `CacheEntryKey::hash()`.
+  const CacheEntryKey kExistingKey("colliding-key-2018");
+  const CacheEntryKey kCollidingKey("colliding-key-3000");
+  ASSERT_NE(kExistingKey, kCollidingKey);
+  ASSERT_EQ(kExistingKey.hash(), kCollidingKey.hash());
+
+  const auto res_id = CreateEntryAndGetResId(kExistingKey);
+  ASSERT_EQ(store_->GetIndexStateForHash(kExistingKey.hash()),
+            SqlPersistentStore::IndexState::kHashFound);
+
+  // Attempt to doom `kCollidingKey` using `kExistingKey`'s `res_id`. The
+  // database row's `cache_key` does not match, so the operation must report
+  // `kNotFound` without modifying the database.
+  EXPECT_EQ(DoomEntry(kCollidingKey, res_id),
+            SqlPersistentStore::Error::kNotFound);
+
+  // The existing entry must remain in the in-memory index.
+  EXPECT_EQ(store_->GetIndexStateForHash(kExistingKey.hash()),
+            SqlPersistentStore::IndexState::kHashFound);
+
+  // The existing entry must remain unaffected in the database as well.
+  EXPECT_EQ(GetEntryCount(), 1);
+  auto open_result = OpenEntry(kExistingKey);
+  ASSERT_TRUE(open_result.has_value());
+  ASSERT_TRUE(open_result->has_value());
+  EXPECT_EQ((*open_result)->res_id, res_id);
 }
 
 TEST_P(SqlPersistentStoreTest,
